@@ -12,6 +12,8 @@ import streamlit as st
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
+DATA_FILE = ROOT / "data" / "snapshots.csv"
+
 from src.binance_client import fetch_depth as fetch_binance  # noqa: E402
 from src.hyperliquid_client import fetch_depth as fetch_hl  # noqa: E402
 from src.config import POLL_INTERVAL_SEC, ROLLING_WINDOW_SEC, SYMBOLS  # noqa: E402
@@ -26,8 +28,8 @@ st.caption("Public order book — Binance / Hyperliquid. Spread, 2% depth, imbal
 source = st.sidebar.selectbox("Source", ["Binance", "Hyperliquid"], index=0)
 symbol = st.sidebar.selectbox("Symbol", SYMBOLS, index=0)
 limit = st.sidebar.selectbox("Depth limit (kecil = lebih cepat)", [20, 50, 100], index=0)
-auto = st.sidebar.checkbox("Auto-refresh", value=False)
-poll = st.sidebar.slider("Refresh (detik)", 2, 30, max(POLL_INTERVAL_SEC, 5))
+auto = st.sidebar.checkbox("Auto-refresh", value=True)
+poll = st.sidebar.slider("Refresh (detik)", 5, 30, 10)
 st.sidebar.divider()
 side = st.sidebar.selectbox("Slippage side", ["SELL (market sell ke bid)", "BUY (market buy ke ask)"])
 size = st.sidebar.number_input("Slippage size (coin)", min_value=0.001, value=1.0, step=1.0)
@@ -36,7 +38,47 @@ if st.sidebar.button("Refresh sekarang"):
 if st.sidebar.button("Reset history"):
     st.session_state.pop("spread_hist", None)
     st.session_state.pop("snapshots", None)
+    st.session_state.pop("_hydrated", None)
+    try:
+        if DATA_FILE.exists():
+            DATA_FILE.unlink()
+    except Exception:
+        pass
     st.rerun()
+
+
+def _load_persisted():
+    # Dipanggil sekali tiap buka halaman: ambil history dari file agar refresh tidak mulai dari nol.
+    if st.session_state.get("_hydrated"):
+        return
+    st.session_state["_hydrated"] = True
+    try:
+        if DATA_FILE.exists():
+            df = pd.read_csv(DATA_FILE).tail(2000)
+            st.session_state["snapshots"] = df.to_dict("records")
+            hist = []
+            for _, r in df.iterrows():
+                try:
+                    hist.append({"ts": datetime.fromisoformat(str(r["timestamp"])),
+                                 "symbol": r.get("symbol"), "source": r.get("source"),
+                                 "spread_bps": float(r.get("spread_bps", 0)),
+                                 "mid": float(r.get("mid", 0))})
+                except Exception:
+                    continue
+            st.session_state["spread_hist"] = hist
+    except Exception:
+        pass
+
+
+def _save_persisted():
+    try:
+        DATA_FILE.parent.mkdir(parents=True, exist_ok=True)
+        pd.DataFrame(st.session_state.get("snapshots", [])).tail(2000).to_csv(DATA_FILE, index=False)
+    except Exception:
+        pass
+
+
+_load_persisted()
 
 
 @st.fragment(run_every=poll if auto else None)
@@ -82,6 +124,7 @@ def dashboard():
                    "depth_bid_2pct_usd": round(d_bid, 0), "depth_ask_2pct_usd": round(d_ask, 0),
                    "imbalance": round(imb, 3)})
     st.session_state["snapshots"] = snaps[-500:]
+    _save_persisted()
 
     # ---- KPIs ----
     c1, c2, c3, c4, c5 = st.columns(5)
@@ -152,7 +195,7 @@ def dashboard():
 def allocation_section(fetcher, src_name: str, depth_limit: int):
     st.divider()
     st.subheader("Liquidity allocation across pairs")
-    st.caption("CCTV 3 pair sekaligus. Hijau = sehat, merah = perlu ditegur. Database? Cukup CSV ini.")
+    st.caption("Pantau 3 pair sekaligus. Status SEHAT jika spread <= 10 bps dan total depth >= $1 juta.")
     if st.button("Scan semua pair"):
         st.rerun()
     rows = []
