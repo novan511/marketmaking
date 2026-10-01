@@ -1,0 +1,6 @@
+streamlit>=1.32
+plotly>=5.20
+pandas>=2.0
+requests>=2.31
+websocket-client>=1.7
+openpyxl>=3.1
