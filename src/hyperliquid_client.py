@@ -11,7 +11,9 @@ def _parse(entry) -> tuple:
     return float(entry[0]), float(entry[1])
 
 def fetch_depth(symbol: str, limit: int = 100, timeout: int = 25) -> dict:
-    coin = MAP.get(symbol, "BTC")
+    coin = MAP.get(symbol)
+    if coin is None:
+        raise ValueError(f"Symbol {symbol} tidak didukung di Hyperliquid")
     r = requests.post(API, json={"type": "l2Book", "coin": coin}, timeout=timeout)
     r.raise_for_status()
     j = r.json()
