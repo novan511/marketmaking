@@ -20,6 +20,7 @@ SERIES_FILE = DATA_DIR / "series.csv"       # collector: time series
 EVENTS_FILE = DATA_DIR / "events.jsonl"     # collector: events
 HEARTBEAT_FILE = DATA_DIR / "heartbeat.json"  # collector: status
 
+from src.app_collector import ensure_running, running_mode  # noqa: E402
 from src.binance_client import fetch_depth as fetch_binance  # noqa: E402
 from src.export import events_csv, events_json, load_events, report_md  # noqa: E402
 from src.hyperliquid_client import fetch_depth as fetch_hl  # noqa: E402
@@ -52,7 +53,11 @@ if st.sidebar.button("Reset history"):
     except Exception:
         pass
     st.rerun()
-st.sidebar.caption("Event & surveillance dijalankan proses terpisah: `python3 run_collector.py` (lihat README).")
+st.sidebar.caption("Event & surveillance: proses `python3 run_collector.py` (24/7), "
+                   "atau in-app otomatis bila collector eksternal tidak aktif.")
+
+# Pastikan ada collector: eksternal (run_collector.py) atau in-app (thread background).
+_collector_mode = ensure_running(SYMBOLS, DATA_DIR, tick=2.0, depth_limit=100)
 
 
 def _load_persisted():
@@ -122,15 +127,20 @@ def events_section():
     st.subheader("Continuous monitoring (collector)")
     hb = _collector_status()
     if hb is None:
-        st.warning("Collector belum pernah jalan / tidak ada heartbeat. "
-                   "Jalankan: `python3 run_collector.py` (lihat README bagian 'Continuous Monitoring').")
+        st.info("Collector in-app sedang mulai... data pertama biasanya < 10 detik.")
     elif hb["age"] > 15:
         st.warning(f"Heartbeat terakhir {hb['age']:.0f}s lalu — collector kemungkinan tidak aktif. "
-                   "Jalankan: `python3 run_collector.py`")
+                   "Klik 'Refresh sekarang' atau jalankan: `python3 run_collector.py`")
     else:
         extra = f" Event terakhir: {hb['last_event_id']}." if hb.get("last_event_id") else ""
-        st.success(f"Collector aktif (pid {hb.get('pid')}), heartbeat {hb['age']:.0f}s lalu, "
-                   f"error 60s terakhir: {hb.get('errors_60s', 0)}.{extra}")
+        if hb.get("in_app"):
+            st.success(f"Collector in-app aktif, heartbeat {hb['age']:.0f}s lalu, "
+                       f"error 60s terakhir: {hb.get('errors_60s', 0)}.{extra} "
+                       "(hanya jalan selama instance ini hidup; untuk 24/7 jalankan "
+                       "`python3 run_collector.py` di mesin sendiri/VPS)")
+        else:
+            st.success(f"Collector eksternal aktif (pid {hb.get('pid')}), heartbeat {hb['age']:.0f}s "
+                       f"lalu, error 60s terakhir: {hb.get('errors_60s', 0)}.{extra}")
 
     series = _read_series(hours=6)
     events = load_events(EVENTS_FILE)

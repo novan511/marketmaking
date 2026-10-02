@@ -38,6 +38,53 @@ SERIES_ROTATE_BYTES = 40 * 1024 * 1024
 TRADE_LIMIT = 1000
 
 
+def fetch_depth(session, symbol: str, limit: int, timeout: float = 4.0) -> dict:
+    """Fetch depth dengan failover antar base (fast-fail agar loop tidak blocked lama)."""
+    last = None
+    for base in BASES:
+        for _ in range(2):
+            try:
+                r = session.get(
+                    f"{base}/api/v3/depth",
+                    params={"symbol": symbol, "limit": limit},
+                    timeout=timeout,
+                )
+                r.raise_for_status()
+                return r.json()
+            except Exception as e:
+                last = e
+    raise RuntimeError(f"semua endpoint depth gagal: {last}")
+
+
+def fetch_trades_delta(session, state: dict, symbol: str, limit: int = TRADE_LIMIT,
+                       timeout: float = 4.0) -> Tuple[float, float, bool]:
+    """Delta aggregate trades via /api/v3/aggTrades (fromId didukung, weight 10).
+    state: {"last_id": int|None}. Returns (taker_buy_usd, taker_sell_usd, complete)."""
+    params = {"symbol": symbol, "limit": limit}
+    if state["last_id"] is not None:
+        params["fromId"] = state["last_id"]  # inklusif -> dedup di bawah
+    r = session.get(f"{BASES[0]}/api/v3/aggTrades", params=params, timeout=timeout)
+    r.raise_for_status()
+    j = r.json()
+    if state["last_id"] is None:
+        state["last_id"] = j[-1]["a"] if j else None
+        return 0.0, 0.0, True
+    tb = tsell = 0.0
+    for t in j:
+        aid = t["a"]
+        if aid <= state["last_id"]:
+            continue
+        notional = float(t["p"]) * float(t["q"])
+        if t["m"]:
+            tsell += notional   # buyer=maker -> agresornya SELL
+        else:
+            tb += notional      # agresornya BUY
+        if aid > state["last_id"]:
+            state["last_id"] = aid
+    complete = len(j) < limit  # >= limit berarti kemungkinan ada gap
+    return tb, tsell, complete
+
+
 def diff_book(prev: Dict[str, float], new: Dict[str, float], side: str) -> dict:
     """Diff dua book {price_str: qty}. Returns {"added","removed","movers"} (USD)."""
     added = removed = 0.0
@@ -63,7 +110,8 @@ def diff_book(prev: Dict[str, float], new: Dict[str, float], side: str) -> dict:
 class Collector:
     def __init__(self, symbols, outdir="data", tick: float = 1.0,
                  depth_limit: int = 100, trades: bool = True,
-                 cfg: Optional[EventConfig] = None, source: str = "binance"):
+                 cfg: Optional[EventConfig] = None, source: str = "binance",
+                 in_app: bool = False):
         self.symbols = list(symbols)
         self.outdir = Path(outdir)
         self.logdir = self.outdir / "logs"
@@ -78,6 +126,8 @@ class Collector:
         self.trade_state = {s: {"last_id": None} for s in self.symbols}
         self.errors: deque = deque(maxlen=500)
         self.last_event_id: Optional[str] = None
+        self.in_app = in_app
+        self.external_check = None  # callable() -> bool; jika True, loop berhenti
         self._stop = False
         self.series_path = self.outdir / "series.csv"
         self.events_path = self.outdir / "events.jsonl"
@@ -122,48 +172,10 @@ class Collector:
 
     # ---------- fetch ----------
     def _fetch_depth(self, symbol: str) -> dict:
-        last = None
-        for base in BASES:
-            for _ in range(2):
-                try:
-                    r = self.session.get(
-                        f"{base}/api/v3/depth",
-                        params={"symbol": symbol, "limit": self.depth_limit},
-                        timeout=4.0,
-                    )
-                    r.raise_for_status()
-                    return r.json()
-                except Exception as e:
-                    last = e
-        raise RuntimeError(f"semua endpoint depth gagal: {last}")
+        return fetch_depth(self.session, symbol, self.depth_limit)
 
     def _fetch_trades(self, symbol: str) -> Tuple[float, float, bool]:
-        """Delta aggregate trades via /api/v3/aggTrades (fromId didukung, weight 10).
-        Returns (taker_buy_usd, taker_sell_usd, complete)."""
-        st = self.trade_state[symbol]
-        params = {"symbol": symbol, "limit": TRADE_LIMIT}
-        if st["last_id"] is not None:
-            params["fromId"] = st["last_id"]  # inklusif -> dedup di bawah
-        r = self.session.get(f"{BASES[0]}/api/v3/aggTrades", params=params, timeout=4.0)
-        r.raise_for_status()
-        j = r.json()
-        if st["last_id"] is None:
-            st["last_id"] = j[-1]["a"] if j else None
-            return 0.0, 0.0, True
-        tb = tsell = 0.0
-        for t in j:
-            aid = t["a"]
-            if aid <= st["last_id"]:
-                continue
-            notional = float(t["p"]) * float(t["q"])
-            if t["m"]:
-                tsell += notional   # buyer=maker -> agresornya SELL
-            else:
-                tb += notional      # agresornya BUY
-            if aid > st["last_id"]:
-                st["last_id"] = aid
-        complete = len(j) < TRADE_LIMIT  # >= limit berarti kemungkinan ada gap
-        return tb, tsell, complete
+        return fetch_trades_delta(self.session, self.trade_state[symbol], symbol)
 
     # ---------- tick ----------
     def _tick(self, sym: str):
@@ -262,6 +274,7 @@ class Collector:
             "epoch": now, "pid": os.getpid(), "symbols": self.symbols,
             "tick_sec": self.tick, "errors_60s": errs,
             "last_event_id": self.last_event_id,
+            "in_app": self.in_app,
         }
         tmp = self.outdir / "heartbeat.json.tmp"
         tmp.write_text(json.dumps(hb))
@@ -273,11 +286,16 @@ class Collector:
     # ---------- main loop ----------
     def run(self, once: bool = False):
         self._install_signals()
-        self.log.info("collector start: %s, tick=%.1fs, depth=%d, trades=%s, outdir=%s",
+        self.log.info("collector start%s: %s, tick=%.1fs, depth=%d, trades=%s, outdir=%s",
+                      " (in-app)" if self.in_app else "",
                       ",".join(self.symbols), self.tick, self.depth_limit,
                       self.trades, self.outdir)
         self._write_heartbeat()
         while not self._stop:
+            if self.external_check is not None and self.external_check():
+                self.log.info("collector eksternal terdeteksi aktif -> stop %s",
+                              "in-app" if self.in_app else "ini")
+                break
             t0 = time.time()
             for sym in self.symbols:
                 if self._stop:

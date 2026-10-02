@@ -134,6 +134,39 @@ def test_slippage_sanity():
     assert res["filled_pct"] == 100.0
 
 
+def test_external_heartbeat_detection():
+    import json as _json
+    import tempfile
+    import time
+    from src.app_collector import external_heartbeat_fresh
+    with tempfile.TemporaryDirectory() as td:
+        assert not external_heartbeat_fresh(td)  # tidak ada file
+        p = Path(td) / "heartbeat.json"
+        p.write_text(_json.dumps({"epoch": time.time(), "in_app": True}))
+        assert not external_heartbeat_fresh(td)  # in-app bukan eksternal
+        p.write_text(_json.dumps({"epoch": time.time()}))
+        assert external_heartbeat_fresh(td)  # eksternal fresh
+        p.write_text(_json.dumps({"epoch": time.time() - 999}))
+        assert not external_heartbeat_fresh(td)  # kedaluwarsa
+
+
+def test_in_app_collector_writes_data():
+    import json as _json
+    import tempfile
+    import time
+    from src.app_collector import InAppCollector
+    with tempfile.TemporaryDirectory() as td:
+        c = InAppCollector(symbols=["BTCUSDT"], outdir=td, tick=1.0, depth_limit=50)
+        c.start()
+        time.sleep(6)
+        c.collector._stop = True
+        c.thread.join(timeout=10)
+        hb = _json.loads((Path(td) / "heartbeat.json").read_text())
+        assert hb["in_app"] is True
+        rows = (Path(td) / "series.csv").read_text().strip().splitlines()
+        assert len(rows) >= 3  # header + sampel
+
+
 if __name__ == "__main__":
     fns = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]
     for fn in fns:

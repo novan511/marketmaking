@@ -31,6 +31,14 @@ launchctl unload ~/Library/LaunchAgents/com.novandri.mm-collector.plist   # stop
 
 Tuning: `--tick 1.0 --depth-limit 100 --imb-open 0.35 --imb-close 0.20 --persist 5 --no-trades`.
 
+### Mode in-app (Streamlit Cloud)
+Jika tidak ada collector eksternal yang aktif, app menjalankan **in-app collector**
+(thread background di dalam proses Streamlit, tick 2s) sehingga versi online tetap
+mengekspor event selama instance-nya hidup. Batasan Cloud: instance tidur saat
+browser ditutup -> in-app berhenti dan data ephemeral hilang. Untuk 24/7 tetap
+pakai `run_collector.py` di mesin sendiri/VPS. Tab "Event & Surveillance"
+menampilkan mode mana yang aktif (eksternal vs in-app).
+
 ### Deteksi event
 | Event | Trigger |
 |---|---|
